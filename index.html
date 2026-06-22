@@ -230,6 +230,7 @@
             <button onclick="login()">登录</button>
             <div class="login-links">
                 <a onclick="switchAuthView('forgot')">忘记密码？</a>
+                <a onclick="resendVerificationFromLogin()">重发验证邮件</a>
                 <a onclick="switchAuthView('register')">注册账号</a>
             </div>
             <div class="login-links" style="justify-content:center; margin-top:14px;">
@@ -238,7 +239,7 @@
         </div>
 
         <div id="register-page" class="card login-card hidden">
-            <h2 style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">房东管理员注册</h2>
+            <h2 style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">房东账号注册</h2>
             <div class="login-group"><label>登录邮箱</label><input type="email" id="reg-user" placeholder="请输入电子邮箱"></div>
             <div class="login-group"><label>设置登录密码</label><input type="password" id="reg-pass" placeholder="请输入密码"></div>
             <div class="login-group"><label>真实姓名</label><input type="text" id="reg-name" placeholder="请输入您的姓名"></div>
@@ -391,6 +392,7 @@
         const MASTER_MIGRATION_EMAIL = "cz3237420068@gmail.com"; // 只有这个主邮箱可以从旧库迁移数据
         const REQUIRE_EMAIL_VERIFICATION = true; // 注册后必须先验证邮箱才能使用
         const ACCOUNT_DELETE_HOLD_DAYS = 7; // 注销账号后数据保留 7 天
+        const ACTION_URL = window.location.origin + window.location.pathname; // 验证邮件完成后回到本 App
         let db = null;
         let auth = null;
         let currentUser = null;
@@ -404,6 +406,7 @@
                 if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
                 db = firebase.firestore();
                 auth = firebase.auth();
+                auth.languageCode = 'zh-CN';
 
                 auth.onAuthStateChanged(async (user) => {
                     currentUser = user;
@@ -415,8 +418,12 @@
                         return;
                     }
 
+                    if (REQUIRE_EMAIL_VERIFICATION) {
+                        try { await user.reload(); user = auth.currentUser || user; currentUser = user; } catch (e) { console.warn('刷新邮箱验证状态失败：', e); }
+                    }
+
                     if (REQUIRE_EMAIL_VERIFICATION && !user.emailVerified) {
-                        await auth.signOut();
+                        // 未验证邮箱不能进入 App。这里不立刻 signOut，避免和登录函数里“发送验证邮件”的流程打架。
                         currentUser = null;
                         cloudRef = null;
                         cloudSyncReady = false;
@@ -529,6 +536,7 @@
                     ownerUid: user.uid,
                     email: user.email,
                     migratedFrom,
+                    migrationCompleted: true,
                     emailVerified: !!user.emailVerified,
                     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                 }, { merge: true });
@@ -615,6 +623,29 @@
             renderProperties();
         }
 
+
+        function closeModal() { $('edit-modal').style.display = 'none'; }
+        function saveEdit() {
+            if (!editingTenantId) { closeModal(); return; }
+            const p = properties.find(x => x.id === currentPropId);
+            if (!p || !p.tenants) { closeModal(); return; }
+            const t = p.tenants.find(x => x.id === editingTenantId);
+            if (!t) { closeModal(); return; }
+            const roomNum = $('edit-t-room').value.trim();
+            const name = $('edit-t-name').value.trim();
+            const phone = $('edit-t-phone').value.trim();
+            if (!roomNum || !name || !phone) return alert('房间号、姓名、电话号码均为必填项！');
+            t.roomNumber = roomNum;
+            t.name = name;
+            t.phone = phone;
+            t.rent = $('edit-t-rent').value.trim();
+            t.deposit = $('edit-t-deposit').value.trim();
+            t.date = $('edit-t-date').value.trim();
+            t.payDay = $('edit-t-payday').value.trim();
+            t.remark = $('edit-t-remark').value.trim();
+            save(); closeModal(); renderTenants();
+        }
+
         function openAboutModal() { $('about-modal').style.display = 'flex'; }
         function closeAboutModal() { $('about-modal').style.display = 'none'; }
 
@@ -676,23 +707,28 @@
             const regEmail = ($('reg-email').value.trim() || em).toLowerCase();
             if(!em || !p || !n || !ph || !regEmail) return alert('所有信息均为必填项！');
             if(!em.includes('@')) return alert('请输入有效的电子邮箱地址');
+            if(em !== regEmail) return alert('登录邮箱和电子邮箱必须一致，请使用同一个邮箱注册。');
             if(p.length < 6) return alert('Firebase 要求密码至少 6 位。');
             try {
                 const cred = await auth.createUserWithEmailAndPassword(em, p);
-                currentUser = cred.user;
-                sysAuth = { user: em, pass: '', name: n, phone: ph, email: regEmail, uid: cred.user.uid };
-                await setupUserCloud(cred.user);
-                save();
+                const user = cred.user;
+                try { await user.updateProfile({ displayName: n }); } catch (e) { console.warn('保存显示名称失败：', e); }
+
                 if (REQUIRE_EMAIL_VERIFICATION) {
-                    await cred.user.sendEmailVerification();
+                    await user.sendEmailVerification({ url: ACTION_URL, handleCodeInApp: false });
                     await auth.signOut();
                     currentUser = null;
                     localStorage.removeItem('landlord_auth');
-                    alert('🎉 注册成功！验证邮件已经发送到你的邮箱。请先打开邮箱点击验证链接，然后再回来登录。');
+                    alert('🎉 注册成功！验证邮件已经发送到你的邮箱。请先打开邮箱点击验证链接，然后再回来登录。\n\n如果没有看到邮件，请检查垃圾邮件，或在登录页点击“重发验证邮件”。');
                     switchAuthView('login');
                     showPage();
                     return;
                 }
+
+                currentUser = user;
+                sysAuth = { user: em, pass: '', name: n, phone: ph, email: regEmail, uid: user.uid };
+                await setupUserCloud(user);
+                save();
                 alert('🎉 账号注册成功！');
                 switchAuthView('login');
                 showPage();
@@ -716,6 +752,32 @@
 
         function executeResetPassword() {
             alert('请使用邮箱里的 Firebase 官方链接重置密码。');
+        }
+
+        async function resendVerificationFromLogin() {
+            if (!USE_CLOUD || !auth) return alert('云端登录未启用，无法发送验证邮件。');
+            const email = ($('login-user').value.trim() || prompt('请输入注册邮箱：') || '').toLowerCase();
+            const pass = $('login-pass').value || prompt('请输入密码，用于确认身份后发送验证邮件：');
+            if (!email || !email.includes('@')) return alert('请输入有效邮箱。');
+            if (!pass) return alert('请输入密码。');
+            try {
+                const cred = await auth.signInWithEmailAndPassword(email, pass);
+                await cred.user.reload();
+                if (cred.user.emailVerified) {
+                    await auth.signOut();
+                    alert('这个邮箱已经验证过了，可以直接登录。');
+                    return;
+                }
+                await cred.user.sendEmailVerification({ url: ACTION_URL, handleCodeInApp: false });
+                await auth.signOut();
+                currentUser = null;
+                localStorage.removeItem('landlord_auth');
+                showPage();
+                alert('✅ 验证邮件已重新发送。请去邮箱点击验证链接，然后回来登录。\n\n如果没看到，请检查垃圾邮件或搜索 noreply@mylandlordapp-a9ae1.firebaseapp.com。');
+            } catch (error) {
+                console.error('重新发送验证邮件失败：', error);
+                alert('发送失败：' + (error.message || error));
+            }
         }
 
         async function deleteAccountFromLogin() {
@@ -764,13 +826,15 @@
             if(!user || !pass) return alert('请输入邮箱和密码');
             try {
                 const cred = await auth.signInWithEmailAndPassword(user, pass);
-                if (REQUIRE_EMAIL_VERIFICATION && !cred.user.emailVerified) {
-                    await cred.user.sendEmailVerification();
+                await cred.user.reload();
+                const verifiedUser = auth.currentUser || cred.user;
+                if (REQUIRE_EMAIL_VERIFICATION && !verifiedUser.emailVerified) {
+                    await verifiedUser.sendEmailVerification({ url: ACTION_URL, handleCodeInApp: false });
                     await auth.signOut();
                     currentUser = null;
                     localStorage.removeItem('landlord_auth');
                     showPage();
-                    alert('⚠️ 这个邮箱还没有验证。我们已经重新发送验证邮件，请先去邮箱点击验证链接，再回来登录。');
+                    alert('⚠️ 这个邮箱还没有验证。我们已经重新发送验证邮件，请先去邮箱点击验证链接，再回来登录。\n\n如果没看到，请检查垃圾邮件，或搜索 noreply@mylandlordapp-a9ae1.firebaseapp.com。');
                     return;
                 }
             } catch (error) {
